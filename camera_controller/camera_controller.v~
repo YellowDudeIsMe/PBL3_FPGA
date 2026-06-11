@@ -1,0 +1,455 @@
+module camera_controller
+(
+/*
+    input  wire clk,
+    input  wire reset,
+    input  wire start,
+
+    // SCCB master interface
+    input  wire sccb_busy,
+    input  wire sccb_done,
+    input  wire sccb_ack_error,
+    output reg  sccb_start,
+    output reg  sccb_stop,
+    output reg  sccb_rw_mode,
+    output reg  [7:0] sccb_reg_addr,
+    output reg  [7:0] sccb_tx_data,
+
+    // ROM interface
+    output reg  [7:0] rom_addr,
+    input  wire [15:0] rom_data,
+
+    // status
+    output reg config_done,
+    output reg config_error
+    */
+    
+    input wire clk_50MHz,
+    input wire reset,
+    input wire start,
+    
+    output wire scl,
+    inout wire sda,
+    
+    input wire vsync,
+    input wire href,
+    
+    input wire pclk,
+//    output wire xclk,
+    
+    input wire [7:0] data,
+    
+    output wire [9:0] x,
+	output wire [9:0] y,
+	output wire [15:0] pixel_data,
+	output wire pixel_done,
+	
+	output reg curr_state
+);
+
+localparam STATE_CONFIG = 0;
+localparam STATE_READ = 1;
+
+wire cfg_done;
+
+camera_config cam_config(
+	.clk(clk_50MHz),
+	.reset(reset),
+	.start(curr_state == STATE_CONFIG),
+	.done(cfg_done),
+	.scl(scl),
+	.sda(sda)
+);
+
+camera_read #(
+    .SCREEN_WIDTH(640)
+) cam_read (
+    .clk(clk_50MHz),
+    .reset(reset),
+    .start(curr_state == STATE_READ),
+    .vsync(vsync),
+    .href(href),
+    .pclk(pclk),
+    .data(data),
+    .x(x),
+    .y(y),
+    .pixel_data(pixel_data),
+    .pixel_done(pixel_done)
+);
+
+initial begin
+	curr_state <= STATE_CONFIG;
+end
+
+always @(posedge clk_50MHz) begin
+    if (reset)
+        curr_state <= STATE_CONFIG;
+    else if (curr_state == STATE_CONFIG && cfg_done)
+        curr_state <= STATE_READ;
+end
+
+endmodule
+
+
+module camera_config
+#(
+	parameter DELAY_CNT_FULL_RESET = 5000,
+	parameter DELAY_CNT_NORMAL_CMD = 5000,
+	parameter DELAY_CNT_TABLE_DONE = 5000
+)
+(
+	input wire clk,
+	input wire reset,
+	
+	input wire start,
+	output wire done,
+	
+	output wire scl,
+	inout wire sda
+);
+	
+function [15:0] config_cmd_lookup
+(
+	input wire [6:0] idx
+);
+begin
+case (idx)
+    0:  config_cmd_lookup = 16'h12_80; // reset
+    
+    1:  config_cmd_lookup = 16'h12_04; // COM7, set RGB color output
+    2:  config_cmd_lookup = 16'h8C_00; // RGB444, disable RGB444 mode, use RGB565
+
+    3:  config_cmd_lookup = 16'h11_80; // CLKRC internal PLL matches input clock
+    4:  config_cmd_lookup = 16'h0C_00; // COM3, default settings
+    5:  config_cmd_lookup = 16'h3E_00; // COM14, no scaling, normal pclock
+    6:  config_cmd_lookup = 16'h04_00; // COM1, disable CCIR656
+    7:  config_cmd_lookup = 16'h40_d0; // COM15, RGB565, full output range
+    8:  config_cmd_lookup = 16'h3a_04; // TSLB, set output data sequence
+    9:  config_cmd_lookup = 16'h14_18; // COM9, MAX AGC value x4
+
+	10: config_cmd_lookup = 16'h4F_80; // MTX1
+	11: config_cmd_lookup = 16'h50_80; // MTX2
+	12: config_cmd_lookup = 16'h51_00; // MTX3
+	13: config_cmd_lookup = 16'h52_22; // MTX4
+	14: config_cmd_lookup = 16'h53_5E; // MTX5
+	15: config_cmd_lookup = 16'h54_80; // MTX6
+	16: config_cmd_lookup = 16'h58_9E; // MTXS
+    17: config_cmd_lookup = 16'h3D_C0; // COM13
+
+    18: config_cmd_lookup = 16'h17_14; // HSTART
+    19: config_cmd_lookup = 16'h18_02; // HSTOP
+    20: config_cmd_lookup = 16'h32_80; // HREF
+    21: config_cmd_lookup = 16'h19_03; // VSTART
+    22: config_cmd_lookup = 16'h1A_7B; // VSTOP
+    23: config_cmd_lookup = 16'h03_0A; // VREF
+    24: config_cmd_lookup = 16'h0F_41; // COM6
+    25: config_cmd_lookup = 16'h1E_00; // MVFP
+
+    26: config_cmd_lookup = 16'h33_0B; // CHLF
+    27: config_cmd_lookup = 16'h3C_78; // COM12
+    28: config_cmd_lookup = 16'h69_00; // GFIX
+    29: config_cmd_lookup = 16'h74_00; // REG74
+    30: config_cmd_lookup = 16'hB0_84; // RSVD
+    31: config_cmd_lookup = 16'hB1_0c; // ABLC1
+    32: config_cmd_lookup = 16'hB2_0e; // RSVD
+    33: config_cmd_lookup = 16'hB3_80; // THL_ST
+
+    // begin mystery scaling numbers
+    34: config_cmd_lookup = 16'h70_3a;
+    35: config_cmd_lookup = 16'h71_35;
+    36: config_cmd_lookup = 16'h72_11;
+    37: config_cmd_lookup = 16'h73_f0;
+    38: config_cmd_lookup = 16'ha2_02;
+
+    // gamma curve values
+    39: config_cmd_lookup = 16'h7a_20;
+    40: config_cmd_lookup = 16'h7b_10;
+    41: config_cmd_lookup = 16'h7c_1e;
+    42: config_cmd_lookup = 16'h7d_35;
+    43: config_cmd_lookup = 16'h7e_5a;
+    44: config_cmd_lookup = 16'h7f_69;
+    45: config_cmd_lookup = 16'h80_76;
+    46: config_cmd_lookup = 16'h81_80;
+    47: config_cmd_lookup = 16'h82_88;
+    48: config_cmd_lookup = 16'h83_8f;
+    49: config_cmd_lookup = 16'h84_96;
+    50: config_cmd_lookup = 16'h85_a3;
+    51: config_cmd_lookup = 16'h86_af;
+    52: config_cmd_lookup = 16'h87_c4;
+    53: config_cmd_lookup = 16'h88_d7;
+    54: config_cmd_lookup = 16'h89_e8;
+
+    // AGC and AEC
+    55: config_cmd_lookup = 16'h13_e0; // COM8, disable AGC / AEC
+    56: config_cmd_lookup = 16'h00_00; // set gain reg to 0 for AGC
+    57: config_cmd_lookup = 16'h10_00; // set ARCJ reg to 0
+    58: config_cmd_lookup = 16'h0d_40; // magic reserved bit for COM4
+    59: config_cmd_lookup = 16'h14_18; // COM9, 4x gain + magic bit
+    60: config_cmd_lookup = 16'ha5_05; // BD50MAX
+    61: config_cmd_lookup = 16'hab_07; // DB60MAX
+    62: config_cmd_lookup = 16'h24_95; // AGC upper limit
+    63: config_cmd_lookup = 16'h25_33; // AGC lower limit
+    64: config_cmd_lookup = 16'h26_e3; // AGC/AEC fast mode op region
+    65: config_cmd_lookup = 16'h9f_78; // HAECC1
+    66: config_cmd_lookup = 16'ha0_68; // HAECC2
+    67: config_cmd_lookup = 16'ha1_03; // magic
+    68: config_cmd_lookup = 16'ha6_d8; // HAECC3
+    69: config_cmd_lookup = 16'ha7_d8; // HAECC4
+    70: config_cmd_lookup = 16'ha8_f0; // HAECC5
+    71: config_cmd_lookup = 16'ha9_90; // HAECC6
+    72: config_cmd_lookup = 16'haa_94; // HAECC7
+    73: config_cmd_lookup = 16'h41_08;
+    
+// AWB / color balance tuning
+73: config_cmd_lookup = 16'h43_0A;
+74: config_cmd_lookup = 16'h44_F0;
+75: config_cmd_lookup = 16'h45_34;
+76: config_cmd_lookup = 16'h46_58;
+77: config_cmd_lookup = 16'h47_28;
+78: config_cmd_lookup = 16'h48_3A;
+
+79: config_cmd_lookup = 16'h59_88;
+80: config_cmd_lookup = 16'h5A_88;
+81: config_cmd_lookup = 16'h5B_44;
+82: config_cmd_lookup = 16'h5C_67;
+83: config_cmd_lookup = 16'h5D_49;
+84: config_cmd_lookup = 16'h5E_0E;
+
+85: config_cmd_lookup = 16'h6C_0A;
+86: config_cmd_lookup = 16'h6D_55;
+87: config_cmd_lookup = 16'h6E_11;
+88: config_cmd_lookup = 16'h6F_9E;
+
+89: config_cmd_lookup = 16'h6A_40; // G channel AWB gain
+90: config_cmd_lookup = 16'h01_40; // blue gain
+91: config_cmd_lookup = 16'h02_60; // red gain
+92: config_cmd_lookup = 16'h41_08; // COM16, AWB gain enable
+93: config_cmd_lookup = 16'h13_E7; // COM8, enable AGC + AWB + AEC
+    
+    //74: config_cmd_lookup = 16'h42_08;
+    
+    //0: config_cmd_lookup = 16'h1E_30; // COM17, color bar enable
+
+    default: config_cmd_lookup = 16'hFF_FF; // mark end of ROM
+endcase
+end
+endfunction
+
+localparam [1:0]
+	STATE_IDLE = 2'b00,
+	STATE_CMD = 2'b01,
+	STATE_DELAY = 2'b10,
+	STATE_DONE = 2'b11;
+
+reg [6:0] cmd_counter;
+wire [7:0] reg_addr, reg_data;
+wire [15:0] reg_cmd;
+reg [1:0] curr_state;
+
+wire sccb_busy;
+wire sccb_done;
+reg sccb_start;
+wire sccb_clk;
+
+
+reg [31:0] delay_counter;
+
+sccb_clk_gen #(
+    .CLK_IN_FREQ(50000000),
+    .CLK_OUT_FREQ(400000)
+) sccb_clk_inst (
+    .clk_in(clk),
+    .reset(reset),
+    .clk_out(sccb_clk)
+);
+
+sccb_master #(
+    .SLAVE_ADDR(8'h21)
+) fpga (
+    .clk(sccb_clk),
+    .reset(reset),
+    .start(sccb_start),
+    .stop(sccb_done),
+    .rw_mode(1'b0),
+    .reg_addr(reg_addr),
+    .tx_data(reg_data),
+    .rx_data(),
+    .busy(sccb_busy),
+    .done(sccb_done),
+    .ack_error(),
+    .scl(scl),
+    .sda(sda)
+);
+
+assign reg_cmd = config_cmd_lookup(cmd_counter);
+assign reg_addr = reg_cmd[15:8];
+assign reg_data = reg_cmd[7:0];
+assign done = (curr_state == STATE_DONE) ? 1'b1 : 1'b0;
+
+initial begin
+	cmd_counter <= 0;
+	curr_state <= STATE_IDLE;
+	delay_counter <= 0;
+		sccb_start <= 0;
+end
+
+always @(posedge clk or posedge reset) begin
+	if (reset) begin
+		cmd_counter <= 0;
+		curr_state <= STATE_IDLE;
+		delay_counter <= 0;
+		sccb_start <= 0;
+	end else begin
+		case (curr_state)
+			STATE_IDLE: begin
+				if (start == 1) begin
+					curr_state <= STATE_CMD;
+					cmd_counter <= 0;
+				end else begin
+					curr_state <= STATE_IDLE;
+				end
+			end
+			
+			STATE_CMD: begin
+				if (reg_cmd == 16'hFFFF) begin
+					curr_state <= STATE_DONE;
+				end else begin
+					if (sccb_busy == 0) begin
+						sccb_start <= 1;
+					end else begin
+						sccb_start <= 0;
+					end
+					
+					if (sccb_done == 1) begin
+						curr_state <= STATE_DELAY;
+						if (cmd_counter == 0) delay_counter <= DELAY_CNT_FULL_RESET;
+						else delay_counter <= DELAY_CNT_NORMAL_CMD;
+					end
+				end
+			end
+			
+			STATE_DELAY: begin
+                if (delay_counter == 0) begin
+                    cmd_counter <= cmd_counter + 1;
+                    curr_state <= STATE_CMD;
+                end else begin
+                    delay_counter <= delay_counter - 1;
+                end
+			end
+			
+			STATE_DONE: begin
+				curr_state <= STATE_DONE;
+			end
+		endcase
+	end
+end
+
+endmodule
+
+module camera_read
+#(
+	parameter SCREEN_WIDTH = 640
+)
+(
+    input wire clk,
+    input wire reset,
+    input wire start,
+    
+    input wire vsync,
+    input wire href,
+    
+    input wire pclk,
+    
+    input wire [7:0] data,
+    
+    output reg [9:0] x,
+	output reg [9:0] y,
+	output reg [15:0] pixel_data,
+	output reg pixel_done
+);
+
+localparam [1:0]
+	STATE_IDLE = 2'b00,
+	STATE_FRAME_RESET = 2'b01,
+	STATE_BYTE_LOW = 2'b10,
+	STATE_BYTE_HIGH = 2'b11;
+	
+reg [1:0] curr_state;
+
+always @(posedge pclk) begin
+	if (reset) begin
+		curr_state <= STATE_IDLE;
+		pixel_data <= 16'hFFFF;
+		pixel_done <= 0;
+		x <= 0;
+		y <= 0;
+	end else begin
+		pixel_done <= 0;
+		case (curr_state)
+			STATE_IDLE: begin
+				pixel_done <= 0;
+				if (start) begin
+					curr_state <= STATE_FRAME_RESET;
+				end
+			end
+			
+			STATE_FRAME_RESET: begin
+				x <= 0;
+				y <= 0;
+				pixel_done <= 0;
+				if (vsync == 0) begin
+					curr_state <= STATE_BYTE_HIGH;
+				end
+			end
+			
+			STATE_BYTE_LOW: begin
+				if (vsync == 1) begin
+					curr_state <= STATE_FRAME_RESET;
+				end else if (href == 1) begin
+					pixel_data[7:0] <= data;
+					//pixel_done <= 1;
+					
+					        if (x[0] == 2'b00 && y[0] == 2'b00)
+            pixel_done <= 1'b1;
+        else
+            pixel_done <= 1'b0;
+					
+					/*
+					if (x[1:0] == 2'b00 && y[1:0] == 2'b00) begin
+						pixel_done <= 1;
+					end else begin
+						pixel_done <= 0;
+					end
+					*/
+					
+					curr_state <= STATE_BYTE_HIGH;
+					
+					if (x == SCREEN_WIDTH - 1) begin
+						x <= 0;
+						y <= y + 1;
+					end else begin
+						x <= x + 1;
+					end
+				end else begin
+					curr_state <= STATE_BYTE_HIGH;
+					
+					x <= 0;
+					y <= y + 1;
+				end
+			end
+			
+			STATE_BYTE_HIGH: begin
+				if (vsync == 1) begin
+					curr_state <= STATE_FRAME_RESET;
+				end else if (href == 1) begin
+					pixel_data[15:8] <= data;
+					pixel_done <= 0;
+					curr_state <= STATE_BYTE_LOW;
+				end else begin
+					curr_state <= STATE_BYTE_HIGH;
+				end
+			end
+		endcase
+	end
+end
+endmodule

@@ -1,0 +1,276 @@
+module img_processor (
+
+    input wire CLOCK_50,    
+    input wire [3:0] KEY,   
+    input wire [17:0] SW,    
+    input wire p_clock,     
+    input wire vsync,       
+    input wire href,        
+    input wire [7:0] p_data,
+	output wire CAM_XCLK,   
+    inout wire CAM_SIOC,    
+    inout wire CAM_SIOD,    
+
+    output wire CAM_RESET,  
+    output wire CAM_PWDN,   
+    output wire config_done, 
+    output wire VGA_CLK,
+    output wire VGA_HS,
+    output wire VGA_VS,
+    output wire VGA_BLANK_N,
+    output wire VGA_SYNC_N,
+    output wire [9:0] VGA_R,
+    output wire [9:0] VGA_G,
+    output wire [9:0] VGA_B
+
+);
+
+    wire rst_n = ~KEY[0];
+    wire clk_25M;
+    reg clk_div = 0;
+    always @(posedge CLOCK_50) begin
+        clk_div <= ~clk_div;
+    end
+
+    assign clk_25M = clk_div;
+    assign VGA_CLK = clk_25M;
+    assign CAM_XCLK = clk_25M;
+
+    assign CAM_PWDN = 1'b0;  
+    assign CAM_RESET = 1'b1; 
+    
+    wire [9:0] x, y;
+    wire video_on;
+    wire [15:0] pixel_data_from_cam;
+    wire pixel_valid;
+    
+	camera_controller cam_ctrl (
+		.clk_50MHz(CLOCK_50),
+		.reset(rst_n),
+		.start(1'b1),
+		.scl(CAM_SIOC),
+		.sda(CAM_SIOD),
+		.vsync(vsync),
+		.href(href),
+		.pclk(p_clock),
+		.data(p_data),
+		.x(),
+		.y(),
+		.pixel_data(pixel_data_from_cam),
+		.pixel_done(pixel_valid),
+		.curr_state(config_done)
+	);
+		
+	vga_controller #(
+		.H_CNT_MAX(800),
+		.V_CNT_MAX(525),
+		.H_SYNC_CNT(96),
+		.H_BACK_PORCH_CNT(48),
+		.H_DISPLAY_CNT(640),
+		.H_FRONT_PORCH_CNT(16),
+		.V_SYNC_CNT(2),
+		.V_BACK_PORCH_CNT(33),
+		.V_DISPLAY_CNT(480),
+		.V_FRONT_PORCH_CNT(10)
+	) vga_ctrl (
+		.clk(clk_25M),
+		.reset(rst_n),
+		.hs(VGA_HS),
+		.vs(VGA_VS),
+		.blank(VGA_BLANK_N),
+		.sync(VGA_SYNC_N),
+		.h_coor(x),
+		.v_coor(y),
+		.is_display_area(video_on)
+	);
+
+    reg [14:0] write_addr = 0;
+
+
+    // ------------------------------ frame buffer ------------------------------------
+    reg [15:0] frame_buffer [0:19199]; 
+    reg [15:0] pixel_out;
+	wire [7:0] src_x_raw = x[9:2];
+	wire [7:0] src_y_raw = y[9:2];
+
+	wire [7:0] src_x = SW[8] ? (8'd159 - src_x_raw) : src_x_raw;
+	wire [7:0] src_y = SW[9] ? (8'd119 - src_y_raw) : src_y_raw;
+
+	wire [14:0] read_addr = ({7'd0, src_y} * 15'd160) + {7'd0, src_x};
+
+	reg frame_ready = 1'b0;
+
+	always @(posedge p_clock or posedge rst_n) begin
+		if (rst_n) begin
+			write_addr  <= 15'd0;
+			frame_ready <= 1'b0;
+			
+		end else if (vsync) begin
+			write_addr <= 15'd0;
+		end else if (pixel_valid && write_addr < 15'd19200) begin
+			frame_buffer[write_addr] <= pixel_data_from_cam;
+			write_addr <= write_addr + 1'b1;
+
+			if (write_addr == 15'd19199)
+				frame_ready <= 1'b1;
+		end
+	end
+
+    always @(posedge clk_25M) begin
+
+        pixel_out <= frame_buffer[read_addr];
+
+    end
+    
+    wire [7:0] R_in = {pixel_out[15:11], 3'b000};
+    wire [7:0] G_in = {pixel_out[10:5],  2'b00};
+    wire [7:0] B_in = {pixel_out[4:0],   3'b000};
+
+	wire [9:0] gray_sum = {2'b00, R_in} + {2'b00, G_in} + {2'b00, B_in};
+	wire [7:0] gray_val = gray_sum / 3;
+		
+	reg [7:0] prev_gray = 8'd0;
+
+	wire [7:0] diff_gray = (gray_val > prev_gray) ?
+						   (gray_val - prev_gray) :
+						   (prev_gray - gray_val);
+
+	wire [7:0] sketch_pixel = (diff_gray > 8'd12) ? 8'd0 : 8'd255;
+
+    wire [8:0] temp_R;
+    wire [8:0] temp_G;
+    wire [8:0] temp_B;
+    reg [7:0] R_out, G_out, B_out;
+    
+    reg [8:0] white_delta = 0;
+    reg [8:0] black_delta = 0;
+    reg [8:0] red_delta = 0;
+    reg [8:0] green_delta = 0;
+    reg [8:0] blue_delta = 0;
+    
+    assign temp_R = (R_in + white_delta >= black_delta + red_delta) ?
+					R_in + white_delta - black_delta - red_delta : 0;
+    assign temp_G = (G_in + white_delta >= black_delta + green_delta) ?
+					G_in + white_delta - black_delta - green_delta : 0;
+    assign temp_B = (B_in + white_delta >= black_delta + blue_delta) ? 
+					B_in + white_delta - black_delta - blue_delta : 0;
+    
+    wire inc_key = ~KEY[1];
+    wire dec_key = ~KEY[2];
+    
+    reg inc_key_d;
+    reg dec_key_d;
+    reg rst_delta_key_d;
+
+    always @(posedge clk_25M) begin
+			if (video_on) begin
+				
+				if (SW[0]) begin
+
+					if (gray_val > 90) begin
+						R_out <= 8'd255; G_out <= 8'd255; B_out <= 8'd255;
+					end else begin
+						R_out <= 8'd0; G_out <= 8'd0; B_out <= 8'd0;
+					end
+				end else if (SW[1]) begin
+					R_out <= 8'd255 - R_in;
+					G_out <= 8'd255 - G_in;
+					B_out <= 8'd255 - B_in;
+				end else if (SW[2]) begin
+				
+					if ({inc_key_d, inc_key} == 2'b01) begin
+						if (white_delta < 9'd205) white_delta <= white_delta + 9'd50;
+						else white_delta <= 9'd255;
+					end
+					
+					if ({dec_key_d, dec_key} == 2'b01) begin
+						if (white_delta > 9'd49) white_delta <= white_delta - 9'd50;
+						else white_delta <= 0;
+					end
+				
+					R_out <= (temp_R > 9'd255) ? 8'd255 : temp_R[7:0];
+					G_out <= (temp_G > 9'd255) ? 8'd255 : temp_G[7:0];
+					B_out <= (temp_B > 9'd255) ? 8'd255 : temp_B[7:0];
+				end else if (SW[3]) begin
+					
+					if ({inc_key_d, inc_key} == 2'b01) begin
+						if (black_delta < 9'd205) black_delta <= black_delta + 9'd20;
+						else black_delta <= 9'd255;
+					end
+					
+					if ({dec_key_d, dec_key} == 2'b01) begin
+						if (black_delta > 9'd49) black_delta <= black_delta - 9'd20;
+						else black_delta <= 0;
+					end
+				
+					R_out <= (temp_R > 9'd255) ? 8'd255 : temp_R[7:0];
+					G_out <= (temp_G > 9'd255) ? 8'd255 : temp_G[7:0];
+					B_out <= (temp_B > 9'd255) ? 8'd255 : temp_B[7:0];
+				end else if (SW[4]) begin
+					if ({inc_key_d, inc_key} == 2'b01) begin
+						if (red_delta < 9'd205) red_delta <= red_delta + 9'd20;
+						else red_delta <= 9'd255;
+					end
+					
+					if ({dec_key_d, dec_key} == 2'b01) begin
+						if (red_delta > 9'd49) red_delta <= red_delta - 9'd20;
+						else red_delta <= 0;
+					end
+				
+					R_out <= (temp_R > 9'd255) ? 8'd255 : temp_R[7:0];
+					G_out <= (temp_G > 9'd255) ? 8'd255 : temp_G[7:0];
+					B_out <= (temp_B > 9'd255) ? 8'd255 : temp_B[7:0];
+				end else if (SW[5]) begin
+				
+					if ({inc_key_d, inc_key} == 2'b01) begin
+						if (green_delta < 9'd205) green_delta <= green_delta + 9'd20;
+						else green_delta <= 9'd255;
+					end
+					
+					if ({dec_key_d, dec_key} == 2'b01) begin
+						if (green_delta > 9'd49) green_delta <= green_delta - 9'd20;
+						else green_delta <= 0;
+					end
+				
+					R_out <= (temp_R > 9'd255) ? 8'd255 : temp_R[7:0];
+					G_out <= (temp_G > 9'd255) ? 8'd255 : temp_G[7:0];
+					B_out <= (temp_B > 9'd255) ? 8'd255 : temp_B[7:0];
+				
+				end else if (SW[6]) begin
+				
+					if ({inc_key_d, inc_key} == 2'b01) begin
+						if (blue_delta < 9'd205) blue_delta <= blue_delta + 9'd20;
+						else blue_delta <= 9'd255;
+					end
+					
+					if ({dec_key_d, dec_key} == 2'b01) begin
+						if (blue_delta > 9'd49) blue_delta <= blue_delta - 9'd20;
+						else blue_delta <= 0;
+					end
+				
+					R_out <= (temp_R > 9'd255) ? 8'd255 : temp_R[7:0];
+					G_out <= (temp_G > 9'd255) ? 8'd255 : temp_G[7:0];
+					B_out <= (temp_B > 9'd255) ? 8'd255 : temp_B[7:0];
+				end else if (SW[7]) begin
+					R_out <= sketch_pixel;
+					G_out <= sketch_pixel;
+					B_out <= sketch_pixel;
+				end else begin
+					R_out <= (temp_R > 9'd255) ? 8'd255 : temp_R[7:0];
+					G_out <= (temp_G > 9'd255) ? 8'd255 : temp_G[7:0];
+					B_out <= (temp_B > 9'd255) ? 8'd255 : temp_B[7:0];
+				end
+				prev_gray <= gray_val;
+			end else begin
+				R_out <= 8'd0; G_out <= 8'd0; B_out <= 8'd0;
+				prev_gray <= 8'd0;
+			end
+		
+		inc_key_d <= inc_key;
+		dec_key_d <= dec_key;
+    end
+
+    assign VGA_R = {R_out, 2'b00};
+    assign VGA_G = {G_out, 2'b00};
+	assign VGA_B = {B_out, 2'b00};
+endmodule

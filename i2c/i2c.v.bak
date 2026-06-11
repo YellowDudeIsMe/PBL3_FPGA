@@ -1,0 +1,342 @@
+module sccb_tb
+(
+
+);
+endmodule
+	
+module sccb_master
+#(
+	parameter SLAVE_ADDR = 8'h68
+)
+(
+// 1. System Pins
+    input  wire       clk,    // 400kHz clock
+    input  wire       reset,      // Active-low reset button
+
+    // 2. Internal Control Interface (Handshaking with your ROM controller)
+    input wire       start,   // Pulse HIGH to wake from IDLE and begin
+    input wire stop, // end the transmission or reading
+    input wire       rw_mode,    // 0 = Write to camera, 1 = Read from camera
+    input wire [7:0] reg_addr,   // The 8-bit camera register address to target
+    input wire [7:0] tx_data, // The 8-bit data to send (if in write mode)
+    output reg [7:0] rx_data,  // The 8-bit data received (if in read mode)
+    output reg        busy,       // HIGH while transmitting, LOW when in IDLE
+    output reg        done, // done with 1 byte of transmitting / reading
+
+    // 3. External Physical Pins (Connected to the OV7670 headers)
+    output reg        scl,        // Serial Clock (Always driven by this FSM)
+    inout  wire       sda         // Serial Data (Bidirectional)
+);
+
+localparam [3:0]
+	STATE_IDLE = 0,
+	STATE_TX_START = 1,
+	STATE_TX_SLAVE_ADDR = 2,
+	STATE_TX_REG_ADDR = 3,
+	STATE_TX_DATA = 4,
+	STATE_TX_STOP = 5,
+	STATE_RX_START = 6,
+	STATE_RX_SLAVE_ADDR = 7,
+	STATE_RX_DATA = 8,
+	STATE_RX_STOP = 9;
+	
+localparam [22:0]
+	CLK_FREQUENCY = 5000000,
+	SCL_FREQUENCY = 10000;
+	
+localparam [1:0]
+	SCL_LOW = 0,
+	SCL_RISE = 1,
+	SCL_HIGH = 2,
+	SCL_FALL = 3;
+	
+localparam
+	WRITE_MODE = 1'b0,
+	READ_MODE = 1'b1;
+
+wire sda_in;
+reg sda_out; // REMEMBER that setting sda_out to 1 first before reading sda_in (to release the line)
+reg ack_bit;
+reg [3:0] scl_curr_state, scl_next_state;
+reg [3:0] sccb_curr_state, sccb_next_state;
+reg [7:0] data_byte;
+reg [2:0] data_byte_idx;
+
+assign sda = (sda_out == 0) ? 1'b0 : 1'bz;
+assign sda_in = sda;
+
+always @(posedge clk) begin
+	if (reset) begin
+		// reset
+		scl <= 1;
+		
+		sda_out <= 1;
+		ack_bit <= 1;
+		scl_curr_state <= SCL_LOW;
+		scl_next_state <= SCL_LOW;
+		sccb_curr_state <= STATE_IDLE;
+		sccb_next_state <= STATE_IDLE;
+		data_byte <= 8'h00;
+		data_byte_idx <= 0;
+	end else begin
+		scl_curr_state <= scl_next_state;
+		sccb_curr_state <= sccb_next_state;
+		if (scl_curr_state != STATE_IDLE || start == 1) begin
+			case (scl_curr_state)
+				SCL_LOW: begin
+					scl <= 0;
+					scl_next_state <= SCL_RISE;
+				end
+				SCL_RISE: begin
+					scl <= 1;
+					scl_next_state <= SCL_HIGH;
+				end
+				SCL_HIGH: begin
+					scl <= 1;
+					scl_next_state <= SCL_FALL;
+				end
+				SCL_FALL: begin
+					scl <= 0;
+					scl_next_state <= SCL_LOW;
+				end
+			endcase
+		end else begin
+			scl <= 1;
+		end
+	end
+end
+	
+
+always @(*) begin
+	sccb_next_state <= sccb_curr_state;
+	case (sccb_curr_state)
+		STATE_IDLE: begin
+			done <= 0;
+			busy <= 0;
+			sda_out <= 1;
+			if (start == 1) begin
+				sccb_next_state <= STATE_TX_START;
+			end else begin
+				
+			end
+		end
+		
+		STATE_TX_START: begin
+			done <= 0;
+			busy <= 1;
+			if (scl_curr_state == SCL_HIGH) begin
+				sda_out <= 0;
+			end else if (scl_curr_state == SCL_FALL) begin
+				sda_out <= 0;
+				sccb_next_state <= STATE_TX_SLAVE_ADDR;
+				data_byte <= (SLAVE_ADDR << 1) | WRITE_MODE;
+				data_byte_idx <= 0;
+			end 
+		end
+		
+		STATE_TX_SLAVE_ADDR: begin
+			done <= 0;
+			busy <= 1;
+			if (scl_curr_state == SCL_LOW) begin
+				if (data_byte_idx < 8) begin
+					sda_out <= (data_byte >> (7 - data_byte_idx)) & 1'b1;
+					data_byte_idx <= data_byte_idx + 1;
+				end else if (data_byte_idx == 8) begin
+					data_byte_idx <= data_byte_idx + 1;
+					sda_out <= 1; // release the sda line
+				end else if (data_byte_idx == 9) begin
+					sccb_next_state <= STATE_TX_REG_ADDR;
+					data_byte <= reg_addr;
+					data_byte_idx <= 0;
+				end
+			end else if (scl_curr_state == SCL_HIGH) begin
+				if (data_byte_idx == 8) ack_bit <= sda_in;
+			end
+		end
+		
+		STATE_TX_REG_ADDR: begin
+			done <= 0;
+			busy <= 1;
+			if (scl_curr_state == SCL_LOW) begin
+				if (data_byte_idx < 8) begin
+					sda_out <= (data_byte >> (7 - data_byte_idx)) & 1'b1;
+					data_byte_idx <= data_byte_idx + 1;
+				end else if (data_byte_idx == 8) begin
+					data_byte_idx <= data_byte_idx + 1;
+					sda_out <= 1; // release the sda line
+				end else if (data_byte_idx == 9) begin
+					if (rw_mode == READ_MODE) begin
+						sccb_next_state <= STATE_TX_STOP;
+					end else begin
+						sccb_next_state <= STATE_TX_DATA;
+					end
+					data_byte <= 8'h00;
+					data_byte_idx <= 0;
+				end
+			end else if (scl_curr_state == SCL_HIGH) begin
+				if (data_byte_idx == 8) ack_bit <= sda_in;
+			end
+		end
+		
+		STATE_TX_DATA: begin
+			busy <= 1;
+			if (scl_curr_state == SCL_LOW) begin
+				done <= 0;
+				if (data_byte_idx < 8) begin
+					sda_out <= (data_byte >> (7 - data_byte_idx)) & 1'b1;
+					data_byte_idx <= data_byte_idx + 1;
+				end else if (data_byte_idx == 8) begin
+					sda_out <= 1; // release the sda line
+				end 
+			end else if (scl_curr_state == SCL_HIGH) begin
+				if (data_byte_idx == 8) begin
+					ack_bit <= sda_in;
+					if (stop == 1) begin
+						sccb_next_state <= STATE_TX_STOP;
+						sda_out <= 0;
+					end
+					done <= 1;
+					data_byte <= 8'h00;
+					data_byte_idx <= 0;
+				end
+			end else if (scl_curr_state == SCL_FALL) begin
+				if (data_byte_idx == 0) data_byte <= tx_data;
+			end
+		end
+		
+		STATE_TX_STOP: begin
+			busy <= 1;
+			
+			if (scl_curr_state == SCL_RISE) begin
+				sda_out <= 0;
+			end
+			if (scl_curr_state == SCL_HIGH) begin
+				done <= 0;
+				sda_out <= 1;
+			end else if (scl_curr_state == SCL_FALL) begin
+				if (rw_mode == READ_MODE) sccb_next_state <= STATE_RX_START;
+				else sccb_next_state <= STATE_IDLE;
+				data_byte <= 8'h00;
+				data_byte_idx <= 0;
+			end 
+		end
+		
+		STATE_RX_START: begin
+			done <= 0;
+			busy <= 1;
+			if (scl_curr_state == SCL_HIGH) begin
+				sda_out <= 0;
+			end else if (scl_curr_state == SCL_FALL) begin
+				sda_out <= 0;
+				sccb_next_state <= STATE_RX_SLAVE_ADDR;
+				data_byte <= (SLAVE_ADDR << 1) | READ_MODE;
+				data_byte_idx <= 0;
+			end 
+		end
+		
+		STATE_RX_SLAVE_ADDR: begin
+			done <= 0;
+			busy <= 1;
+			if (scl_curr_state == SCL_LOW) begin
+				if (data_byte_idx < 8) begin
+					sda_out <= (data_byte >> (7 - data_byte_idx)) & 1'b1;
+					data_byte_idx <= data_byte_idx + 1;
+				end else if (data_byte_idx == 8) begin
+					data_byte_idx <= data_byte_idx + 1;
+					sda_out <= 1; // release the sda line
+				end else if (data_byte_idx == 9) begin
+					sccb_next_state <= STATE_RX_DATA;
+					data_byte <= 8'h00;
+					data_byte_idx <= 0;
+					sda_out <= 1; // release the sda line
+				end
+			end else if (scl_curr_state == SCL_HIGH) begin
+				if (data_byte_idx == 8) ack_bit <= sda_in;
+			end
+		end
+		
+		STATE_RX_DATA: begin
+			busy <= 1;
+			sda_out <= 1; // release the sda line
+			if (scl_curr_state == SCL_LOW) begin
+				done <= 0;
+				if (data_byte_idx < 8) begin
+					data_byte <= (data_byte << 1) | sda_in;
+					data_byte_idx <= data_byte_idx + 1;
+				end else if (data_byte_idx == 8) begin
+					rx_data <= data_byte;
+					done <= 1;
+					if (stop == 1) sda_out <= 1; // master nack to end
+					else sda_out <= 0; // master ack
+				end
+			end else if (scl_curr_state == SCL_HIGH) begin
+				if (data_byte_idx == 8) begin
+					if (stop == 1) begin
+						sccb_next_state <= STATE_RX_STOP;
+						sda_out <= 0;
+					end
+					done <= 1;
+					data_byte <= 8'h00;
+					data_byte_idx <= 0;
+				end
+			end
+		end
+		
+		STATE_RX_STOP: begin
+			busy <= 1;
+			
+			if (scl_curr_state == SCL_RISE) begin
+				sda_out <= 0;
+			end if (scl_curr_state == SCL_HIGH) begin
+				done <= 0;
+				sda_out <= 1;
+			end else if (scl_curr_state == SCL_FALL) begin
+				sccb_next_state <= STATE_IDLE;
+				data_byte <= 8'h00;
+				data_byte_idx <= 0;
+			end 
+		end
+		default: begin
+			// It's always a good habit to include a default state in Verilog!
+		end
+	endcase
+end
+endmodule
+
+module sccb_clk_gen
+#(
+	parameter CLK_IN_FREQ = 5000000;
+	parameter CLK_OUT_FREQ = 400000;
+	parameter CLK_RATIO = CLK_IN_FREQ / CLK_OUT_FREQ
+)
+(
+	input wire clk_in,
+	input wire reset,
+	
+	output reg clk_out
+);
+
+reg [6:0] counter;
+
+always @(posedge clk_in) begin
+	if (reset) begin
+		counter <= 0;
+		clk_out <= 0;
+	end else begin
+		counter <= counter + 1;
+		if ((counter == CLK_RATIO / 2) && (clk_out == 1)) begin
+			counter <= 0;
+			clk_out <= 0;
+		end
+		if ((counter == CLK_RATIO - CLK_RATIO / 2) && (clk_out == 0)) begin
+			counter <= 0;
+			clk_out <= 1;
+		end
+	end
+end
+
+endmodule
+
+		
+		
+	

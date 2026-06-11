@@ -1,0 +1,44 @@
+module vga_tb
+(
+	input wire clk_in,
+	
+	
+	output wire [9:0] r,
+	output wire [9:0] g,
+	output wire [9:0] b,
+	output wire hs, // active low
+	output wire vs, // active low
+	output wire blank,
+	output wire sync,
+	output wire clk_out
+);
+
+wire [9:0] h_counter;
+wire [9:0] v_counter;
+wire is_display_area;
+
+vga_clk_gen vga_clk(
+	.clk_in(clk_in),
+	.reset(1'b0),
+	.clk_out(clk_out)
+);
+
+vga_controller vga0(
+	.clk(clk_out),
+	.reset(1'b0),
+	.hs(hs),
+	.vs(vs),
+	.blank(blank),
+	.sync(sync),
+    .h_counter(h_counter),
+    .v_counter(v_counter),
+    .is_display_area(is_display_area)
+);
+
+assign g = (is_display_area) ? 10'h3FF : 10'd0;
+assign r = 10'd0;
+assign b = 10'd0;
+
+endmodule
+
+

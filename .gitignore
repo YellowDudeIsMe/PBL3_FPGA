@@ -1,0 +1,43 @@
+# ==========================================
+# Quartus Prime Ignore List
+# ==========================================
+
+# 1. Compilation Databases (The heavyweights)
+db/
+incremental_db/
+greybox_tmp/
+reconfig/
+
+# 2. Output and Report Files (Regenerated on every build)
+output_files/
+*.rpt
+*.smsg
+*.summary
+*.jdi
+*.pin
+*.done
+*.qdf
+*.pof
+*.sof
+*.sld
+*.csv
+*.cmp
+
+# 3. User Workspace & GUI Settings (Local only)
+*.qws
+*.ddb
+*.kpt
+*.ini
+
+# 4. Simulation & Testbench Generated Files
+# Note: DO keep your handwritten testbenches, but ignore ModelSim/Questa generated junk
+simulation/modelsim/
+simulation/questa/
+*.wlf
+*.vstf
+transcript
+modelsim.ini
+
+# 5. OS Generated Files
+.DS_Store
+Thumbs.db
